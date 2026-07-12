@@ -17,9 +17,21 @@ from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 from collections import deque
 
 import requests
+from requests.structures import CaseInsensitiveDict
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger("vulnscan.crawler")
+
+
+class _Fetched:
+    """Lightweight response-like object so the crawl loop can treat a
+    browser-rendered page and a plain `requests` response identically."""
+
+    def __init__(self, url, text, headers, status_code):
+        self.url = url
+        self.text = text
+        self.headers = headers          # CaseInsensitiveDict
+        self.status_code = status_code
 
 
 class CrawlResult:
@@ -128,11 +140,14 @@ class Crawler:
         "order", "orders", "id", "view", "edit", "show",
     }
 
-    def __init__(self, seed_url, max_pages=100, session=None, timeout=10, extra_seeds=None):
+    def __init__(self, seed_url, max_pages=100, session=None, timeout=10,
+                 extra_seeds=None, render_js=False):
         self.seed_url = seed_url.rstrip("/")
         self.max_pages = max_pages
         self.timeout = timeout
         self.extra_seeds = extra_seeds or []
+        self.render_js = render_js
+        self._renderer = None
 
         parsed = urlparse(self.seed_url)
         self.base_domain = parsed.netloc
@@ -181,15 +196,25 @@ class Crawler:
         logger.info(f"Extra seeds: {len(self.extra_seeds)}")
         logger.info(f"Max pages: {self.max_pages}")
 
+        self._setup_renderer()
+        try:
+            self._crawl_loop(queue)
+        finally:
+            if self._renderer is not None:
+                self._renderer.close()
+                self._renderer = None
+
+        logger.info(
+            f"Crawl complete. {self.result.summary()}"
+        )
+        return self.result
+
+    def _crawl_loop(self, queue):
         while queue and len(self.result.pages) < self.max_pages:
             url = queue.popleft()
 
-            try:
-                response = self.session.get(
-                    url, timeout=self.timeout, allow_redirects=True
-                )
-            except requests.RequestException as e:
-                logger.debug(f"Failed to fetch {url}: {e}")
+            response = self._fetch(url)
+            if response is None:
                 continue
 
             # Track redirects
@@ -248,10 +273,57 @@ class Crawler:
                     self.visited.add(normalized)
                     queue.append(redir_url)
 
-        logger.info(
-            f"Crawl complete. {self.result.summary()}"
-        )
-        return self.result
+    # ── fetching (plain HTTP or headless-browser render) ──────
+
+    def _setup_renderer(self):
+        """Spin up the headless browser if --render-js was requested.
+        Falls back silently to plain HTTP if Playwright/Chromium is missing."""
+        if not self.render_js:
+            return
+        from .renderer import PlaywrightRenderer, RendererUnavailable
+        try:
+            self._renderer = PlaywrightRenderer(
+                timeout=self.timeout,
+                user_agent=self.session.headers.get("User-Agent"),
+                cookies=self._browser_cookies(),
+            )
+            logger.info("JS rendering enabled (Playwright/Chromium)")
+        except RendererUnavailable as e:
+            logger.warning(
+                f"JS rendering unavailable — falling back to plain HTTP.\n{e}"
+            )
+            self._renderer = None
+
+    def _browser_cookies(self):
+        """Translate the session's cookies into Playwright's cookie format."""
+        cookies = []
+        for c in self.session.cookies:
+            ck = {"name": c.name, "value": c.value, "path": c.path or "/"}
+            if c.domain:
+                ck["domain"] = c.domain
+            else:
+                ck["url"] = self.seed_url
+            cookies.append(ck)
+        return cookies
+
+    def _fetch(self, url):
+        """Fetch a URL as a response-like object, or None on failure.
+
+        Uses the headless renderer when enabled; on any render error it
+        degrades gracefully to a plain HTTP GET so the crawl still proceeds.
+        """
+        if self._renderer is not None:
+            try:
+                final_url, html, headers, status = self._renderer.fetch(url)
+                return _Fetched(final_url, html, CaseInsensitiveDict(headers), status)
+            except Exception as e:
+                logger.debug(f"Render failed for {url}, retrying over HTTP: {e}")
+
+        try:
+            return self.session.get(url, timeout=self.timeout, allow_redirects=True)
+        except requests.RequestException as e:
+            logger.debug(f"Failed to fetch {url}: {e}")
+            return None
 
     def _is_in_scope(self, url):
         """Check if URL belongs to the target domain."""

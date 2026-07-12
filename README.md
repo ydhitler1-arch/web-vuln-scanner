@@ -41,6 +41,10 @@ python main.py https://yourtarget.com --modules xss sqli
 # Skip the recon phases to go straight to crawl + scan
 python main.py https://yourtarget.com --skip-discovery --skip-subdomains
 
+# Render JavaScript so SPAs (React/Vue/Angular) become crawlable
+# (one-time: pip install playwright && playwright install chromium)
+python main.py https://yourtarget.com --render-js
+
 # Limit crawl depth, increase timeout, raise recon concurrency
 python main.py https://yourtarget.com --max-pages 50 --timeout 15 --workers 40
 
@@ -93,6 +97,7 @@ scanner/
 | `--header` | — | Custom header (`Name: Value`), repeatable |
 | `--skip-discovery` | off | Skip the directory/path discovery phase |
 | `--skip-subdomains` | off | Skip subdomain enumeration |
+| `--render-js` | off | Render pages with headless Chromium so JS/SPA content is crawlable (needs Playwright) |
 | `-v`, `--verbose` | off | Verbose/debug logging |
 
 ## Disclaimer

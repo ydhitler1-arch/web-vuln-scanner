@@ -122,6 +122,15 @@ Examples:
         help="Skip subdomain enumeration",
     )
     parser.add_argument(
+        "--render-js",
+        action="store_true",
+        help=(
+            "Render pages with a headless browser (Playwright) so JavaScript "
+            "SPAs are crawlable. Requires: pip install playwright && "
+            "playwright install chromium"
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose/debug logging",
@@ -220,6 +229,7 @@ def main():
     print(f"  {Fore.WHITE}Max pages:{Style.RESET_ALL} {Fore.YELLOW}{args.max_pages}{Style.RESET_ALL}")
     print(f"  {Fore.WHITE}Discovery:{Style.RESET_ALL} {Fore.YELLOW}{'skip' if args.skip_discovery else 'enabled'}{Style.RESET_ALL}")
     print(f"  {Fore.WHITE}Subdomains:{Style.RESET_ALL}{Fore.YELLOW} {'skip' if args.skip_subdomains else 'enabled'}{Style.RESET_ALL}")
+    print(f"  {Fore.WHITE}JS render:{Style.RESET_ALL} {Fore.YELLOW}{'enabled' if args.render_js else 'off'}{Style.RESET_ALL}")
     print()
 
     session = build_session(args)
@@ -298,6 +308,7 @@ def main():
         session=session,
         timeout=args.timeout,
         extra_seeds=extra_seeds,
+        render_js=args.render_js,
     )
     crawl_result = crawler.crawl()
 
