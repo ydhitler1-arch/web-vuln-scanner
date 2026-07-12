@@ -14,6 +14,7 @@ A modular, Python-based web vulnerability scanner that discovers, crawls a targe
 | **Open Redirect** | Unvalidated redirects via URL params and form fields |
 | **Path Traversal / LFI** | `../` traversal in params, forms, and path segments, verified by leaked `/etc/passwd` or `win.ini` content |
 | **Headers** | 6 security headers, insecure cookie flags, HTTPS enforcement, server disclosure |
+| **Privacy** | *(passive, no attack traffic)* third-party trackers, analytics/ad IDs, first/third-party cookies, missing privacy headers |
 
 ### Reconnaissance (runs before crawling, on by default)
 
@@ -83,7 +84,7 @@ scanner/
 | Flag | Default | Description |
 |---|---|---|
 | `target` | *(prompted if omitted)* | Target URL |
-| `--modules` | all | Space-separated list: `xss sqli csrf open_redirect path_traversal headers` |
+| `--modules` | all | Space-separated list: `xss sqli csrf open_redirect path_traversal headers privacy` |
 | `--max-pages` | 100 | Max pages to crawl |
 | `--timeout` | 10 | HTTP request timeout (seconds) |
 | `--workers` | 20 | Concurrent requests for the discovery/subdomain phases |

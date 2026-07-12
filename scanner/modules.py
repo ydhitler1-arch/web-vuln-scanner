@@ -11,6 +11,7 @@ Modules:
     - OpenRedirectScanner  — unvalidated redirect parameters
     - PathTraversalScanner — path traversal / local file inclusion (LFI)
     - HeaderScanner        — missing security headers, insecure cookies, HTTP usage
+    - PrivacyScanner       — passive third-party tracker / cookie / privacy audit
 """
 
 import re
@@ -18,6 +19,7 @@ import logging
 from urllib.parse import urlparse, urlencode, parse_qs, urlunparse, quote
 
 import requests
+from bs4 import BeautifulSoup
 
 from .reporter import Finding
 
@@ -1089,6 +1091,235 @@ class PathTraversalScanner(BaseModule):
 
 
 # ─────────────────────────────────────────────────────────────
+#  Privacy Scanner  (passive — no attack traffic)
+# ─────────────────────────────────────────────────────────────
+
+class PrivacyScanner(BaseModule):
+    """
+    Passive privacy / data-collection audit.
+
+    Answers "what does this site collect / share about a visitor" WITHOUT
+    sending any attack traffic — it only performs plain GETs (the same thing
+    a browser does) and inspects the returned HTML and headers for:
+
+      1. Third-party domains the page pulls resources from
+      2. Known analytics / advertising / tracking scripts (with their IDs)
+      3. Cookies set on load (first- vs third-party)
+      4. Missing privacy-protecting response headers
+
+    Caveat: this cannot execute JavaScript, so trackers injected at runtime
+    are not always visible. Findings are informational/privacy-oriented and
+    are capped at LOW severity so they never trip the CRITICAL/HIGH exit code.
+    """
+
+    name = "privacy"
+    description = "Passive third-party tracker, cookie, and privacy audit"
+
+    # (label, category, compiled regex, id-extraction regex-or-None)
+    TRACKER_SIGNATURES = [
+        ("Google Analytics (GA4/UA)", "analytics",
+         re.compile(r"google-analytics\.com|googletagmanager\.com/gtag", re.I),
+         re.compile(r"\b(?:G-[A-Z0-9]{8,}|UA-\d{4,}-\d+)\b")),
+        ("Google Tag Manager", "tag-manager",
+         re.compile(r"googletagmanager\.com/gtm", re.I),
+         re.compile(r"\bGTM-[A-Z0-9]+\b")),
+        ("Google AdSense / Ads", "advertising",
+         re.compile(r"googlesyndication\.com|adsbygoogle|googleadservices", re.I), None),
+        ("DoubleClick", "advertising",
+         re.compile(r"doubleclick\.net", re.I), None),
+        ("Facebook Pixel", "advertising",
+         re.compile(r"connect\.facebook\.net|fbq\(", re.I),
+         re.compile(r"fbq\(\s*['\"]init['\"]\s*,\s*['\"](\d+)['\"]")),
+        ("Yandex Metrica", "analytics",
+         re.compile(r"mc\.yandex\.ru|yandex\.ru/metrika", re.I), None),
+        ("TikTok Pixel", "advertising",
+         re.compile(r"analytics\.tiktok\.com", re.I), None),
+        ("Hotjar", "session-recording",
+         re.compile(r"static\.hotjar\.com|hotjar\.com/c/hotjar", re.I), None),
+        ("Microsoft Clarity", "session-recording",
+         re.compile(r"clarity\.ms", re.I), None),
+        ("OneSignal / Web Push", "push-notifications",
+         re.compile(r"onesignal\.com|cdn\.onesignal", re.I), None),
+        ("Aggressive ad network / pop-under", "intrusive-ads",
+         re.compile(r"popads|popcash|propellerads|onclicka|popunder|adsterra|hilltopads|clickadu|propu\.sh", re.I), None),
+        ("In-browser crypto miner", "malicious",
+         re.compile(r"coinhive|cryptonight|coin-hive|webminepool|cryptoloot|deepminer", re.I), None),
+    ]
+
+    # Response headers that protect visitor privacy when present
+    PRIVACY_HEADERS = {
+        "Referrer-Policy":
+            "Without a Referrer-Policy, full URLs (which may contain sensitive "
+            "data) are leaked to third-party sites in the Referer header.",
+        "Permissions-Policy":
+            "Without a Permissions-Policy, the page and its embedded third "
+            "parties may access powerful features (camera, mic, geolocation).",
+    }
+
+    def scan(self, crawl_result):
+        self.findings = []
+        self._seen = set()
+
+        # Fall back to the seed page if the crawl found nothing (e.g. a JS-only
+        # site) so the privacy audit still produces a result.
+        pages = list(crawl_result.pages) or self._seed_pages(crawl_result)
+        pages_to_check = pages[:5]
+        logger.info(f"[Privacy] Auditing {len(pages_to_check)} page(s) for trackers/cookies")
+
+        base_reg = None
+        for url in pages_to_check:
+            if base_reg is None:
+                base_reg = self._registrable(urlparse(url).netloc)
+            resp = self._passive_get(url)
+            if resp is None:
+                continue
+            self._check_third_parties(url, resp, base_reg)
+            self._check_trackers(url, resp)
+            self._check_cookies(url, resp, base_reg)
+            self._check_privacy_headers(url, resp)
+
+        logger.info(f"[Privacy] Done. {len(self.findings)} finding(s).")
+        return self.findings
+
+    # ── helpers ──────────────────────────────────────────────
+
+    def _seed_pages(self, crawl_result):
+        for attr in ("seed_url", "target_url"):
+            u = getattr(crawl_result, attr, None)
+            if u:
+                return [u]
+        return []
+
+    def _passive_get(self, url):
+        """Plain GET that follows redirects — mirrors a real browser visit."""
+        try:
+            return self.session.get(url, timeout=self.timeout, allow_redirects=True)
+        except requests.RequestException as e:
+            logger.debug(f"[Privacy] GET failed for {url}: {e}")
+            return None
+
+    @staticmethod
+    def _registrable(netloc):
+        """Best-effort registrable domain (last two labels), lowercased."""
+        host = (netloc or "").lower().split(":")[0]
+        if host.startswith("www."):
+            host = host[4:]
+        parts = host.split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+    def _add_once(self, key, finding):
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        self.findings.append(finding)
+
+    def _check_third_parties(self, url, resp, base_reg):
+        soup = BeautifulSoup(resp.text, "html.parser")
+        hosts = {}
+        for tag, attr in [("script", "src"), ("link", "href"), ("img", "src"),
+                          ("iframe", "src"), ("form", "action"), ("source", "src")]:
+            for el in soup.find_all(tag):
+                val = el.get(attr)
+                if not val:
+                    continue
+                if val.startswith("//"):
+                    val = "https:" + val
+                if not val.startswith("http"):
+                    continue
+                netloc = urlparse(val).netloc
+                if netloc and self._registrable(netloc) != base_reg:
+                    hosts[self._registrable(netloc)] = hosts.get(self._registrable(netloc), 0) + 1
+
+        for host, count in sorted(hosts.items(), key=lambda kv: -kv[1]):
+            self._add_once(
+                ("thirdparty", host),
+                self._make_finding(
+                    severity="INFO",
+                    title=f"Third-party resource loaded from {host}",
+                    description=(
+                        "The page loads content from a domain outside the target "
+                        "site. Third parties can observe your IP, page, and set cookies."
+                    ),
+                    url=url,
+                    evidence=f"{count} resource(s) reference {host}",
+                    remediation=(
+                        "Review whether this third party is necessary; self-host "
+                        "assets and add it to your privacy policy if it stays."
+                    ),
+                ),
+            )
+
+    def _check_trackers(self, url, resp):
+        body = resp.text
+        for label, category, sig, id_re in self.TRACKER_SIGNATURES:
+            if not sig.search(body):
+                continue
+            ids = sorted(set(id_re.findall(body)))[:5] if id_re else []
+            id_str = f" (id: {', '.join(ids)})" if ids else ""
+            # Malicious / intrusive categories are worth LOW; the rest INFO.
+            severity = "LOW" if category in ("malicious", "intrusive-ads",
+                                             "session-recording", "push-notifications") else "INFO"
+            self._add_once(
+                ("tracker", label),
+                self._make_finding(
+                    severity=severity,
+                    title=f"{label} detected [{category}]",
+                    description=(
+                        f"The page includes a {category} script that can collect "
+                        "visitor behaviour and share it with the third party."
+                    ),
+                    url=url,
+                    evidence=f"Signature for {label} present in page{id_str}",
+                    remediation=(
+                        "Disclose this tracker in your privacy/cookie policy and "
+                        "obtain consent where required (GDPR/ePrivacy). Remove "
+                        "unexpected or intrusive ad/mining scripts."
+                    ),
+                ),
+            )
+
+    def _check_cookies(self, url, resp, base_reg):
+        for cookie in resp.cookies:
+            third_party = self._registrable(cookie.domain) != base_reg
+            self._add_once(
+                ("privcookie", cookie.name),
+                self._make_finding(
+                    severity="LOW" if third_party else "INFO",
+                    title=(
+                        f"{'Third-party' if third_party else 'First-party'} "
+                        f"cookie set: {cookie.name}"
+                    ),
+                    description=(
+                        "A cookie was stored on your device on page load. "
+                        "Third-party cookies enable cross-site tracking."
+                    ),
+                    url=url,
+                    evidence=f"Set-Cookie {cookie.name} (domain={cookie.domain})",
+                    remediation=(
+                        "Only set cookies that are strictly necessary before "
+                        "consent; obtain consent for tracking cookies."
+                    ),
+                ),
+            )
+
+    def _check_privacy_headers(self, url, resp):
+        present = {k.lower() for k in resp.headers.keys()}
+        for header, why in self.PRIVACY_HEADERS.items():
+            if header.lower() not in present:
+                self._add_once(
+                    ("privheader", header),
+                    self._make_finding(
+                        severity="LOW",
+                        title=f"Missing {header} header",
+                        description=why,
+                        url=url,
+                        evidence=f"Header '{header}' not present in response",
+                        remediation=f"Set a {header} response header.",
+                    ),
+                )
+
+
+# ─────────────────────────────────────────────────────────────
 #  Module Registry
 # ─────────────────────────────────────────────────────────────
 
@@ -1100,6 +1331,7 @@ MODULE_REGISTRY = {
     "open_redirect": OpenRedirectScanner,
     "path_traversal": PathTraversalScanner,
     "headers": HeaderScanner,
+    "privacy": PrivacyScanner,
 }
 
 ALL_MODULE_NAMES = list(MODULE_REGISTRY.keys())
