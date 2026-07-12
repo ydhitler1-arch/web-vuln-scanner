@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Scan output (generated at runtime)
+report.json
+report.txt
+report.html
+reports/
+
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
