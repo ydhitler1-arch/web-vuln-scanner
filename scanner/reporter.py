@@ -216,6 +216,7 @@ class Reporter:
     def generate_html(self, output_path="report.html"):
         """Write a self-contained, styled HTML report (no external assets)."""
         import html as _html
+        from urllib.parse import urlparse
 
         data = self._build_report_data()
         meta = data["scan_metadata"]
@@ -228,6 +229,16 @@ class Reporter:
 
         def esc(v):
             return _html.escape(str(v))
+
+        def safe_link(url):
+            """Render as a clickable link only for http(s) URLs; otherwise plain escaped text."""
+            try:
+                scheme = urlparse(url).scheme.lower()
+            except Exception:
+                scheme = ""
+            if scheme in ("http", "https"):
+                return f'<a href="{esc(url)}">{esc(url)}</a>'
+            return esc(url)
 
         # Summary chips
         chips = []
@@ -245,7 +256,7 @@ class Reporter:
             color = sev_color.get(sev, "#6b7280")
             rows = [
                 ("Module", esc(f["module"])),
-                ("URL", f'<a href="{esc(f["url"])}">{esc(f["url"])}</a>'),
+                ("URL", safe_link(f["url"])),
                 ("Description", esc(f["description"])),
             ]
             if f["evidence"]:

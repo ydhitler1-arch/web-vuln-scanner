@@ -399,10 +399,12 @@ class Crawler:
     def _extract_forms(self, soup, page_url):
         """Extract all forms and their inputs from a page."""
         for form in soup.find_all("form"):
-            action = form.get("action", "")
+            action = form.get("action", "").strip()
             method = form.get("method", "GET")
 
-            if action:
+            if action and not action.lower().startswith(
+                ("javascript:", "data:", "vbscript:", "mailto:", "tel:")
+            ):
                 action = urljoin(page_url, action)
             else:
                 action = page_url
