@@ -12,6 +12,8 @@ report.txt
 report.html
 reports/
 
+# Local (machine-specific) dev settings
+.devconfig/settings.local.json
 
 # Editor / OS
 .vscode/
@@ -19,3 +21,5 @@ reports/
 .DS_Store
 Thumbs.db
 
+# Project dev config (local machine paths)
+.devconfig/
